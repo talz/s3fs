@@ -140,6 +140,7 @@ class S3FileSystem(AbstractFileSystem):
     """
     root_marker = ""
     connect_timeout = 5
+    retries = 5
     read_timeout = 15
     default_block_size = 5 * 2**20
     protocol = 's3'
@@ -192,12 +193,23 @@ class S3FileSystem(AbstractFileSystem):
         return self._kwargs_helper.filter_dict(s3_method.__name__, kwargs)
 
     def _call_s3(self, method, *akwarglist, **kwargs):
-        kw2 = kwargs.copy()
-        kw2.pop('Body', None)
-        logger.debug("CALL: %s - %s - %s" % (method.__name__, akwarglist, kw2))
-        additional_kwargs = self._get_s3_method_kwargs(method, *akwarglist,
-                                                       **kwargs)
-        return method(**additional_kwargs)
+        for attempt in range(self.retries + 1):
+            try:
+                kw2 = kwargs.copy()
+                kw2.pop('Body', None)
+                logger.debug("CALL: %s - %s - %s" % (method.__name__, akwarglist, kw2))
+                additional_kwargs = self._get_s3_method_kwargs(method, *akwarglist,
+                                                               **kwargs)
+                return method(**additional_kwargs)
+            except S3_RETRYABLE_ERRORS as exc:
+                if attempt < self.retries:
+                    logger.debug('Exception %r on S3 write, retrying', exc, exc_info=True)
+                time.sleep(1.7**attempt * 0.1)
+            except Exception as exc:
+                raise IOError('Write failed: %r' % exc)
+
+        else:
+            raise IOError('Write failed after %i retries' % self.retries)
 
     def _get_s3_method_kwargs(self, method, *akwarglist, **kwargs):
         additional_kwargs = self.s3_additional_kwargs.copy()
@@ -916,7 +928,6 @@ class S3File(AbstractBufferedFile):
     S3FileSystem.open: used to create ``S3File`` objects
 
     """
-    retries = 5
     part_min = 5 * 2 ** 20
     part_max = 5 * 2 ** 30
 
@@ -1071,23 +1082,11 @@ class S3File(AbstractBufferedFile):
             part = len(self.parts) + 1
             logger.debug("Upload chunk %s, %s" % (self, part))
 
-            for attempt in range(self.retries + 1):
-                try:
-                    out = self._call_s3(
-                        self.fs.s3.upload_part,
-                        Bucket=bucket,
-                        PartNumber=part, UploadId=self.mpu['UploadId'],
-                        Body=data0, Key=key)
-                    break
-                except S3_RETRYABLE_ERRORS as exc:
-                    if attempt < self.retries:
-                        logger.debug('Exception %r on S3 write, retrying', exc,
-                                     exc_info=True)
-                    time.sleep(1.7**attempt * 0.1)
-                except Exception as exc:
-                    raise IOError('Write failed: %r' % exc)
-            else:
-                raise IOError('Write failed after %i retries' % self.retries)
+            out = self._call_s3(
+                self.fs.s3.upload_part,
+                Bucket=bucket,
+                PartNumber=part, UploadId=self.mpu['UploadId'],
+                Body=data0, Key=key)
 
             self.parts.append({'PartNumber': part, 'ETag': out['ETag']})
 
